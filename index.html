@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- The above 3 meta tags *must* come first in the head; any other head content must come *after* these tags -->
+    <title>Economically Unspendable Bitcoin UTXO Calculator</title>
+    <!-- Bootstrap -->
+    <link href="css/bootstrap.min.css" rel="stylesheet">
+    <!-- HTML5 shim and Respond.js for IE8 support of HTML5 elements and media queries -->
+    <!-- WARNING: Respond.js doesn't work if you view the page via file:// -->
+    <!--[if lt IE 9]>
+    <script src="https://oss.maxcdn.com/html5shiv/3.7.3/html5shiv.min.js"></script>
+    <script src="https://oss.maxcdn.com/respond/1.4.2/respond.min.js"></script>
+    <![endif]-->
+    <script>
+      const P2PKH_IN_SIZE = 148;
+      
+      // All segwit input sizes are reduced by 1 WU to account for the witness item counts being added for every input per the transaction header
+      const P2SH_P2WPKH_IN_SIZE = 90.75;
+      
+      const P2WPKH_IN_SIZE = 67.75;
+      
+      const P2TR_IN_SIZE = 57.25;
+      
+      const PUBKEY_SIZE = 33;
+      const SIGNATURE_SIZE = 72;
+      
+      function getSizeOfScriptLengthElement(length) {
+        if (length < 75) {
+          return 1;
+        } else if (length <= 255) {
+          return 2;
+        } else if (length <= 65535) {
+          return 3;
+        } else if (length <= 4294967295) {
+          return 5;
+        } else {
+          alert('Size of redeem script is too large');
+        }
+      }
+      
+      function getSizeOfVarInt(length) {
+        if (length < 253) {
+          return 1;
+        } else if (length < 65535) {
+          return 3;
+        } else if (length < 4294967295) {
+          return 5;
+        } else if (length < 18446744073709551615) {
+          return 9;
+        } else {
+          alert("Invalid var int");
+        }
+      }
+
+      function getTxOverheadVBytes(input_script, input_count, output_count) {
+        if (input_script == "P2PKH" || input_script == "P2SH") {
+          var witness_vbytes = 0;
+        } else { // Transactions with segwit inputs have extra overhead
+          var witness_vbytes = 0.25                 // segwit marker
+                            + 0.25                  // segwit flag
+                            + input_count / 4;      // witness element count per input
+        }
+
+        return 4 // nVersion
+              + getSizeOfVarInt(input_count) // number of inputs
+              + getSizeOfVarInt(output_count) // number of outputs
+              + 4 // nLockTime
+              + witness_vbytes;
+      }
+
+      function getTxOverheadExtraRawBytes(input_script, input_count) {
+        // Returns the remaining 3/4 bytes per witness bytes
+        if (input_script == "P2PKH" || input_script == "P2SH") {
+          var witness_bytes = 0;
+        } else { // Transactions with segwit inputs have extra overhead
+          var witness_bytes = 0.25             // segwit marker
+                           + 0.25              // segwit flag
+                           + input_count / 4;  // witness element count per input
+        }
+
+        return witness_bytes * 3;
+      }
+
+      function processForm() {
+        // Validate transaction input attributes
+        var input_count = 1;
+        var output_count = 2;
+        var input_script = document.getElementById('input_script').value;
+        var input_m = parseInt(document.getElementById('input_m').value);
+        if (!Number.isInteger(input_m) || input_m < 0) {
+          alert('expecting positive signature count');
+          return;
+        }
+        var input_n = parseInt(document.getElementById('input_n').value);
+        if (!Number.isInteger(input_n) || input_n < 0) {
+          alert('expecting positive pubkey count');
+          return;
+        }
+
+        // In most cases the input size is predictable. For multisig inputs we need to perform a detailed calculation
+        var inputSize = 0; // in virtual bytes
+        var inputWitnessSize = 0;
+        switch (input_script) {
+          case "P2PKH":
+            inputSize = P2PKH_IN_SIZE;
+            break;
+          case "P2SH-P2WPKH":
+            inputSize = P2SH_P2WPKH_IN_SIZE;
+            inputWitnessSize = 107; // size(signature) + signature + size(pubkey) + pubkey
+            break;
+          case "P2WPKH":
+            inputSize = P2WPKH_IN_SIZE;
+            inputWitnessSize = 107; // size(signature) + signature + size(pubkey) + pubkey
+            break;
+          case "P2TR": // Only consider the cooperative taproot signing path; assume multisig is done via aggregate signatures
+            inputSize = P2TR_IN_SIZE;
+            inputWitnessSize = 65; // getSizeOfVarInt(schnorrSignature) + schnorrSignature;
+            break;
+          case "P2SH":
+            var redeemScriptSize = 1 + // OP_M
+                                  input_n*(1 + PUBKEY_SIZE) + // OP_PUSH33 <pubkey>
+                                  1 + // OP_N
+                                  1; // OP_CHECKMULTISIG
+            var scriptSigSize = 1 + // size(0)
+                              input_m * (1 + SIGNATURE_SIZE) + // size(SIGNATURE_SIZE) + signature
+                              getSizeOfScriptLengthElement(redeemScriptSize) + redeemScriptSize;
+            inputSize = 32 + 4 + getSizeOfVarInt(scriptSigSize) + scriptSigSize + 4;
+            break;
+          case "P2SH-P2WSH":
+          case "P2WSH":
+            var redeemScriptSize = 1 + // OP_M
+                                  input_n*(1 + PUBKEY_SIZE) + // OP_PUSH33 <pubkey>
+                                  1 + // OP_N
+                                  1; // OP_CHECKMULTISIG
+            inputWitnessSize = 1 + // size(0)
+                              input_m * (1 + SIGNATURE_SIZE) + // size(SIGNATURE_SIZE) + signature
+                              getSizeOfScriptLengthElement(redeemScriptSize) + redeemScriptSize;
+            inputSize = 36 + // outpoint (spent UTXO ID)
+                        inputWitnessSize / 4 + // witness program
+                        4;  // nSequence
+            if (input_script == "P2SH-P2WSH") {
+              inputSize += 32 + 3; // P2SH wrapper (redeemscript hash) + overhead?
+            }
+        }
+      
+        var txVBytes = getTxOverheadVBytes(input_script, input_count, output_count) + inputSize;
+        txVBytes = Math.ceil(txVBytes);
+
+        var txBytes = getTxOverheadExtraRawBytes(input_script, input_count) + txVBytes + (inputWitnessSize * input_count) * 3 / 4;
+        var txWeight = txVBytes * 4;
+
+        document.getElementById('txVBytes').innerHTML = txVBytes;
+
+        // generate a plot with X axis of fee rate an Y axis of cost to spend UTXO
+        // fee rates in units of 10 from 1 to 1000 satoshis per virtual byte
+        let xValues = [1];
+        let yValues = [txVBytes];
+        for (let i = 10; i <= 1000; i += 10) {
+          xValues.push(i);
+          let cost = i * txVBytes;
+          yValues.push(cost);
+        }
+
+        window.PLOTLYENV = window.PLOTLYENV || {};
+        var layout = {
+          autosize: true,
+          paper_bgcolor: 'transparent',
+          plot_bgcolor: 'transparent',
+          hovermode: 'closest',
+          showlegend: false,
+
+          legend: {
+            orientation: "h",
+            x: 0.5,
+            xanchor: "center",
+          },
+
+         // X-axis styling
+          xaxis: {
+
+            title:       'Fee Rate (satoshis per virtual byte)',
+            range: [0, 1000],
+
+            showgrid: false,
+            automargin: true,
+            autorange: true,
+
+            // vertical crosshair
+            showspikes:true,
+            spikemode:'across',
+            spikethickness:0.5,
+            spikecolor:'#333',
+            spikedash:'line',
+          },
+
+        // Y-axis styling
+          yaxis: {
+
+            title:       'Spend Fee (satoshis)',
+            //type:        'linear',
+            //hoverformat: '.4r',
+            titlefont: {
+                family: 'Open Sans, Arial',
+                weight: 500,
+                size: 12,
+                color: '#666'
+            },
+
+            showgrid: false,
+            automargin: true,
+            zeroline: false,
+
+            // horizontal crosshair
+            showspikes:true,
+            spikemode:'across',
+            spikethickness:0.5,
+            spikecolor:'#333',
+            spikedash:'line',
+          }
+        }
+
+        var cost = [{
+           x: xValues,
+           y: yValues,
+           marker: {
+              opacity: 0
+           },
+           line: {
+              color:'rgb(31, 119, 180)',
+              width: 1,
+              dash: ''
+           },
+           type: 'line',
+           opacity:1,
+           showlegend:true,
+
+           name:'UTXO Spend Cost',
+           hoverinfo:'x,y',
+           yaxis:'y',
+
+           hoverlabel: {
+              bordercolor:'#FFF',
+              font: { family: 'Open Sans, Arial', weight: 500, size: 10, },
+           },
+        }];
+
+        Plotly.newPlot('chart', cost, layout, {responsive: true});
+      }
+    </script>
+    <script>
+      window.PlotlyConfig = {MathJaxConfig: 'local'};
+    </script>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+      html, body {
+        width: 99%;
+        height: 99%;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+    <h1 class="text-center">Economically Unspendable Bitcoin UTXO Calculator</h1>
+    <hr/>
+    <div class="row">
+      <div class="col-md-12">
+        <form role="form" action="javascript:void(0);">
+          <div>
+            <div class="col-sm-2">
+            </div>
+            <div class="col-sm-10">
+              <p>This calculator will give you an idea of how much it costs to spend a UTXO with specific characteristics. When that cost is computed, we can determine what the viable floor value of that type of UTXO is for any given transaction fee rate, which means you should avoid receiving deposits below that value.</p>
+              <p>If you want to understand how transaction input sizes get calculated, check out the explanation on the <a href="https://bitcoinops.org/en/tools/calc-size">Bitcoin Optech Calculator</a></p>
+            </div>
+          </div>
+          <div>
+            <label class="col-sm-2"></label>
+            <div class="col-sm-10">
+              <div class="form-group row">
+                <h4>What are the UTXO's characteristics?</h4>
+                <label for="input_script" class="col-sm-4 col-form-label">Script type</label>
+                <div class="col-sm-3">
+                  <select id="input_script" class="format form-control">
+                    <option value="P2PKH" selected>P2PKH</option>
+                    <option value="P2SH">P2SH</option>
+                    <option value="P2SH-P2WPKH">P2WPKH in P2SH</option>
+                    <option value="P2SH-P2WSH">P2WSH in P2SH</option>
+                    <option value="P2WPKH">P2WPKH</option>
+                    <option value="P2WSH">P2WSH</option>
+                    <option value="P2TR">P2TR</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group row">
+                <label for="input_m" class="col-sm-4 col-form-label">Signatures required</label>
+                <div class="col-sm-2">
+                  <input type="text" id="input_m" class="format form-control" value="1" maxlength="5" size="5" />
+                </div>
+              </div>
+              <div class="form-group row">
+                <label for="input_n" class="col-sm-4 col-form-label">How many total public keys? (1 for single sig, N for M of N multisig)</label>
+                <div class="col-sm-2">
+                  <input type="text" id="input_n" class="format form-control" value="1" maxlength="5" size="5" />
+                </div>
+              </div>
+              <button class="btn btn-primary" onclick="processForm();return false;">Calculate</button><br/>
+              Size in virtual bytes: <span id="txVBytes"></span><br/>
+              What fee rate should you choose? You can see the <a href="https://statoshi.info/d/000000017/fee-estimates?orgId=1&from=now-5y&to=now&viewPanel=3">past 5 years of transaction fee rates here</a>. During periods of high demand, fees can easily exceed 100 satoshis per virtual byte.
+              <div id="chart" class="plotly-graph-div" style="height:100%; width:100%;"></div>
+            </div>
+          </div>
+        </form>
+      </div>
+      <hr/>
+      <div class="col-md-12">
+        <div>
+          <hr/>
+          <div class="col-sm-2">
+          </div>
+          <div class="col-sm-10">
+            <h2>This tool is 100% open source code</h2>
+            <p>
+              <span>The Economically Unspendable Bitcoin UTXO Calculator repository can be found at </span>
+              <a href="https://github.com/jlopp/unspendable-utxo-calculator" target="_blank">
+              https://github.com/jlopp/unspendable-utxo-calculator
+              </a>
+            </p>
+            <h3>Libraries</h3>
+            <p>
+              <span>Twitter Bootstrap: </span>
+              <a href="http://getbootstrap.com/" target="_blank">
+              http://getbootstrap.com/
+              </a>
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
